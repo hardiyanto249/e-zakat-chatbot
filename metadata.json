@@ -1,0 +1,5 @@
+{
+  "name": "Postgres AI Chatbot",
+  "description": "An AI-powered chatbot that allows users to perform CRUD operations on a simulated PostgreSQL database using natural language commands. It leverages the Gemini API's function calling capabilities to translate user requests into database actions.",
+  "requestFramePermissions": []
+}
