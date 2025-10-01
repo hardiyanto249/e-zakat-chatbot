@@ -11,7 +11,12 @@ const zakatTypes = 'Fitrah, Fidyah, Mal, Infak, Wakaf, Kemanusiaan';
 const tools: FunctionDeclaration[] = [
     {
         name: 'get_all_zakat',
-        description: 'Mendapatkan daftar semua laporan zakat dari database.',
+        description: 'Mendapatkan daftar semua laporan zakat dari database. Aksi ini mungkin terbatas tergantung peran pengguna.',
+        parameters: { type: Type.OBJECT, properties: {} }
+    },
+    {
+        name: 'get_all_users',
+        description: 'Mendapatkan daftar semua relawan yang terdaftar. Hanya bisa dilakukan oleh admin.',
         parameters: { type: Type.OBJECT, properties: {} }
     },
     {
@@ -20,13 +25,13 @@ const tools: FunctionDeclaration[] = [
         parameters: {
             type: Type.OBJECT,
             properties: {
-                volunteerCode: { type: Type.STRING, description: 'Kode unik untuk relawan yang mencatat.' },
+                volunteerCode: { type: Type.STRING, description: 'Kode unik untuk relawan yang mencatat. (Hanya untuk Admin)' },
                 muzakkiName: { type: Type.STRING, description: 'Nama lengkap pemberi zakat (muzakki).' },
                 zakatType: { type: Type.STRING, description: `Jenis zakat yang dibayarkan. Pilihan: ${zakatTypes}.` },
                 amount: { type: Type.NUMBER, description: 'Jumlah total donasi dalam Rupiah (Rp).' },
                 proofOfTransfer: { type: Type.STRING, description: 'Nama file atau path dari bukti transfer yang diunggah.' },
             },
-            required: ['volunteerCode', 'muzakkiName', 'zakatType', 'amount', 'proofOfTransfer'],
+            required: ['muzakkiName', 'zakatType', 'amount', 'proofOfTransfer'],
         },
     },
     {
@@ -56,10 +61,25 @@ const tools: FunctionDeclaration[] = [
             required: ['id'],
         },
     },
+    {
+        name: 'add_user',
+        description: 'Menambahkan pengguna (relawan) baru. Hanya bisa dilakukan oleh admin.',
+        parameters: {
+            type: Type.OBJECT,
+            properties: {
+                name: { type: Type.STRING, description: 'Nama lengkap pengguna baru.' },
+                volunteerCode: { type: Type.STRING, description: 'Kode relawan unik untuk pengguna baru.' },
+                password: { type: Type.STRING, description: 'Password untuk pengguna baru.' },
+                lazName: { type: Type.STRING, description: 'Nama Lembaga Amil Zakat (LAZ) tempat relawan bernaung.' },
+                description: { type: Type.STRING, description: 'Keterangan tambahan mengenai pengguna.' },
+            },
+            required: ['name', 'volunteerCode', 'password', 'lazName'],
+        }
+    }
 ];
 
 const systemInstruction = `Anda adalah asisten AI yang berfokus pada pelaporan dan pengetahuan tentang Zakat.
-Tugas utama Anda adalah membantu pengguna mengelola data laporan zakat menggunakan fungsi yang tersedia (get, add, update, delete).
+Tugas utama Anda adalah membantu pengguna mengelola data laporan zakat menggunakan fungsi yang tersedia. Beberapa aksi mungkin memerlukan hak akses admin.
 
 Selain itu, jika pengguna bertanya tentang konsep atau hukum Zakat, jawablah berdasarkan pengetahuan umum Fikih Zakat, merujuk pada pandangan 4 mazhab (Hanafi, Maliki, Syafi'i, Hanbali). Berikan penekanan khusus pada pandangan mazhab Syafi'i karena merupakan mayoritas di Indonesia.
 

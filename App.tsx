@@ -1,16 +1,17 @@
-
 import React, { useState, useEffect, useCallback } from 'react';
 import { ChatInterface } from './components/ChatInterface';
-import type { Message, Zakat, ZakatType, FunctionCall } from './types';
+import { Login } from './components/Login';
+import type { Message, Zakat, ZakatType, FunctionCall, User } from './types';
 import { getResponse } from './services/geminiService';
 import { executeFunctionCall } from './services/databaseService';
 
 // --- Conversation State Management ---
 interface ConversationContext {
-  active_intent: 'ADD_ZAKAT' | 'CONFIRM_DELETE' | 'CONFIRM_ADD' | null;
-  collected_data: Partial<Omit<Zakat, 'id' | 'createdAt'>>;
-  next_question_key: keyof Omit<Zakat, 'id' | 'createdAt'> | null;
-  pending_function_call: FunctionCall | null; // For delete confirmation
+  active_intent: 'ADD_ZAKAT' | 'CONFIRM_DELETE' | 'CONFIRM_ADD' | 'ADD_USER' | 'CONFIRM_ADD_USER' | null;
+  collected_data: Partial<Omit<Zakat, 'id' | 'createdAt'>> | Partial<User>;
+  next_question_key: keyof Omit<Zakat, 'id' | 'createdAt' | 'volunteerCode'> | keyof User | null;
+  pending_function_call: FunctionCall | null;
+  requires_file_upload: boolean;
 }
 
 const initialConversationContext: ConversationContext = {
@@ -18,6 +19,7 @@ const initialConversationContext: ConversationContext = {
   collected_data: {},
   next_question_key: null,
   pending_function_call: null,
+  requires_file_upload: false,
 };
 
 const ZAKAT_FIELD_QUESTIONS: Record<keyof Omit<Zakat, 'id' | 'createdAt'>, string> = {
@@ -25,12 +27,11 @@ const ZAKAT_FIELD_QUESTIONS: Record<keyof Omit<Zakat, 'id' | 'createdAt'>, strin
     volunteerCode: 'Silakan masukkan kode relawan.',
     zakatType: `Apa jenis zakatnya? (Pilihan: Fitrah, Fidyah, Mal, Infak, Wakaf, Kemanusiaan)`,
     amount: 'Berapa jumlah totalnya (dalam Rupiah)? Cukup ketik angkanya.',
-    proofOfTransfer: 'Terakhir, apa nama file untuk bukti transfer? (contoh: bukti.jpg)'
+    proofOfTransfer: 'Terakhir, silakan unggah bukti transfer (maks. 3MB).'
 };
 
-const ZAKAT_FIELD_ORDER: (keyof typeof ZAKAT_FIELD_QUESTIONS)[] = [
+const ZAKAT_FIELD_ORDER_BASE: (keyof typeof ZAKAT_FIELD_QUESTIONS)[] = [
     'muzakkiName',
-    'volunteerCode',
     'zakatType',
     'amount',
     'proofOfTransfer'
@@ -38,14 +39,29 @@ const ZAKAT_FIELD_ORDER: (keyof typeof ZAKAT_FIELD_QUESTIONS)[] = [
 
 const ZAKAT_TYPES: ZakatType[] = ['Fitrah', 'Fidyah', 'Mal', 'Infak', 'Wakaf', 'Kemanusiaan'];
 
+const USER_FIELD_QUESTIONS: Record<keyof Omit<User, 'role'>, string> = {
+    name: 'Siapa nama lengkap relawan baru?',
+    volunteerCode: 'Apa kode relawan unik untuknya? (contoh: R003)',
+    password: 'Silakan masukkan password sementara untuk relawan ini.',
+    lazName: 'Apa nama Lembaga Amil Zakat (LAZ) tempatnya bernaung?',
+    description: 'Terakhir, adakah keterangan tambahan mengenai relawan ini?'
+};
+
+const USER_FIELD_ORDER: (keyof typeof USER_FIELD_QUESTIONS)[] = [
+    'name',
+    'volunteerCode',
+    'password',
+    'lazName',
+    'description'
+];
 
 const App: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [conversationContext, setConversationContext] = useState<ConversationContext>(initialConversationContext);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
 
-  // --- Utility Functions ---
   const addBotMessage = (text: string, isComponent: boolean = false) => {
     setMessages(prev => [...prev, {
       id: (Date.now() + Math.random()).toString(),
@@ -55,11 +71,25 @@ const App: React.FC = () => {
     }]);
   };
 
+  const getZakatFieldOrder = useCallback(() => {
+    if (currentUser?.role === 'admin') {
+      return ['muzakkiName', 'volunteerCode', 'zakatType', 'amount', 'proofOfTransfer'];
+    }
+    return ZAKAT_FIELD_ORDER_BASE;
+  }, [currentUser]);
+
+
+  // --- ZAKAT COLLECTION FLOW ---
   const finalizeZakatCollection = async (collectedData: Partial<Omit<Zakat, 'id' | 'createdAt'>>) => {
       addBotMessage("Data sudah dikonfirmasi. Saya sedang memproses...", false);
       try {
-          const result = await executeFunctionCall({ name: 'add_zakat', args: collectedData, id: '' });
-          if (typeof result === 'string' && result.startsWith('Operasi database gagal')) {
+          let finalData = { ...collectedData };
+          if (currentUser?.role === 'user') {
+              finalData.volunteerCode = currentUser.volunteerCode;
+          }
+
+          const result = await executeFunctionCall({ name: 'add_zakat', args: finalData, id: '' }, currentUser);
+          if (typeof result === 'string' && (result.startsWith('Operasi database gagal') || result.startsWith('Anda tidak memiliki izin'))) {
               addBotMessage(result);
           } else {
               addBotMessage(JSON.stringify(result, null, 2), true);
@@ -75,54 +105,119 @@ const App: React.FC = () => {
       }
   };
 
-
   const askNextQuestion = useCallback((currentData: Partial<Omit<Zakat, 'id' | 'createdAt'>>) => {
-    const nextField = ZAKAT_FIELD_ORDER.find(key => currentData[key] === undefined);
+    const fieldOrder = getZakatFieldOrder();
+    const nextField = fieldOrder.find(key => currentData[key] === undefined);
 
     if (nextField) {
-      addBotMessage(ZAKAT_FIELD_QUESTIONS[nextField]);
-      setConversationContext(prev => ({ ...prev, next_question_key: nextField }));
-      setIsLoading(false);
+        if (nextField === 'proofOfTransfer') {
+            addBotMessage(ZAKAT_FIELD_QUESTIONS.proofOfTransfer);
+            setConversationContext(prev => ({ ...prev, next_question_key: 'proofOfTransfer', requires_file_upload: true }));
+            setIsLoading(false);
+        } else {
+            addBotMessage(ZAKAT_FIELD_QUESTIONS[nextField]);
+            setConversationContext(prev => ({ ...prev, next_question_key: nextField, requires_file_upload: false }));
+            setIsLoading(false);
+        }
     } else {
-      // All data collected, ask for confirmation before finalizing
+      const displayAmount = currentData.amount ? Number(currentData.amount).toLocaleString('id-ID') : 'N/A';
+      const displayVolunteerCode = currentUser?.role === 'user' ? currentUser.volunteerCode : currentData.volunteerCode;
+
       const summary = `Berikut adalah ringkasan data yang akan disimpan:
 - Nama Muzakki: ${currentData.muzakkiName}
-- Kode Relawan: ${currentData.volunteerCode}
+- Kode Relawan: ${displayVolunteerCode}
 - Jenis Zakat: ${currentData.zakatType}
-- Jumlah: Rp ${Number(currentData.amount).toLocaleString('id-ID')}
+- Jumlah: Rp ${displayAmount}
 - Bukti Transfer: ${currentData.proofOfTransfer}
 
 Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
 
       addBotMessage(summary);
-      // Change intent to CONFIRM_ADD to handle the yes/no response
-      setConversationContext(prev => ({ ...prev, active_intent: 'CONFIRM_ADD', next_question_key: null }));
+      setConversationContext(prev => ({ ...prev, active_intent: 'CONFIRM_ADD', next_question_key: null, requires_file_upload: false }));
       setIsLoading(false);
     }
-  }, []);
+  }, [currentUser, getZakatFieldOrder]);
 
   const startZakatCollection = useCallback((initialData: Partial<Omit<Zakat, 'id' | 'createdAt'>> = {}) => {
     addBotMessage("Tentu, saya akan bantu mencatat laporan zakat baru.");
+    
+    const collectionData = currentUser?.role === 'user'
+      ? { ...initialData, volunteerCode: currentUser.volunteerCode }
+      : initialData;
+
     setConversationContext({
       active_intent: 'ADD_ZAKAT',
-      collected_data: initialData,
-      next_question_key: null, // This being null will trigger the useEffect
+      collected_data: collectionData,
+      next_question_key: null,
       pending_function_call: null,
+      requires_file_upload: false,
     });
-  }, []);
+    // Imperatively ask the first question
+    askNextQuestion(collectionData);
+  }, [currentUser, askNextQuestion]);
 
-  // Effect to start the conversation flow when active_intent is set to ADD_ZAKAT
-  useEffect(() => {
-    if (conversationContext.active_intent === 'ADD_ZAKAT' && conversationContext.next_question_key === null) {
-        // This checks if we just started the process. The first question will be asked here.
-        askNextQuestion(conversationContext.collected_data);
-    }
-  }, [conversationContext, askNextQuestion]);
+  // --- USER COLLECTION FLOW (Admin only) ---
+    const finalizeUserCollection = async (collectedData: Partial<User>) => {
+        addBotMessage("Data relawan sudah dikonfirmasi. Saya sedang menambahkan...", false);
+        try {
+            const result = await executeFunctionCall({ name: 'add_user', args: collectedData, id: '' }, currentUser);
+            if (typeof result === 'string' && result.startsWith('Operasi database gagal')) {
+                addBotMessage(result);
+            } else {
+                addBotMessage(`Berhasil menambahkan relawan baru: ${result.name} (${result.volunteerCode})`);
+            }
+        } catch (e) {
+            const errorMessage = e instanceof Error ? e.message : 'Terjadi kesalahan saat menambah relawan.';
+            addBotMessage(`Error: ${errorMessage}`);
+            setError(errorMessage);
+        } finally {
+            setConversationContext(initialConversationContext);
+            setIsLoading(false);
+        }
+    };
 
+    const askNextUserQuestion = useCallback((currentData: Partial<User>) => {
+        const nextField = USER_FIELD_ORDER.find(key => currentData[key] === undefined);
 
-  const handleCollectingState = useCallback(async (text: string) => {
-    const key = conversationContext.next_question_key;
-    if (!key) { // Should not happen if flow is correct, but as a safeguard
+        if (nextField) {
+            addBotMessage(USER_FIELD_QUESTIONS[nextField]);
+            setConversationContext(prev => ({ ...prev, next_question_key: nextField }));
+            setIsLoading(false);
+        } else {
+            const summary = `Berikut adalah ringkasan data relawan yang akan dibuat:
+- Nama: ${currentData.name}
+- Kode Relawan: ${currentData.volunteerCode}
+- Password: [disembunyikan]
+- Nama LAZ: ${currentData.lazName}
+- Keterangan: ${currentData.description}
+
+Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
+
+            addBotMessage(summary);
+            setConversationContext(prev => ({ ...prev, active_intent: 'CONFIRM_ADD_USER', next_question_key: null }));
+            setIsLoading(false);
+        }
+    }, []);
+
+    const startUserCollection = useCallback(() => {
+        addBotMessage("Baik, mari kita tambahkan relawan baru.");
+        const initialData = {};
+        setConversationContext({
+            active_intent: 'ADD_USER',
+            collected_data: initialData,
+            next_question_key: null,
+            pending_function_call: null,
+            requires_file_upload: false,
+        });
+        // Imperatively ask the first question
+        askNextUserQuestion(initialData);
+    }, [askNextUserQuestion]);
+  
+
+  // --- STATE HANDLERS ---
+  const handleCollectingZakatState = useCallback(async (text: string) => {
+    const key = conversationContext.next_question_key as keyof Omit<Zakat, 'id' | 'createdAt'>;
+    if (!key) {
         setIsLoading(false);
         return;
     }
@@ -130,7 +225,6 @@ Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
     let processedValue: string | number | ZakatType = text;
     let isValid = true;
 
-    // Validation
     if (key === 'amount') {
       const num = parseInt(text.replace(/[^0-9]/g, ''), 10);
       if (isNaN(num)) {
@@ -152,21 +246,43 @@ Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
     if (isValid) {
       const updatedData = { ...conversationContext.collected_data, [key]: processedValue };
       setConversationContext(prev => ({...prev, collected_data: updatedData}));
-      askNextQuestion(updatedData);
+      askNextQuestion(updatedData as Partial<Omit<Zakat, 'id' | 'createdAt'>>);
     } else {
-      setIsLoading(false); // Let the user try again
+      setIsLoading(false);
     }
   }, [conversationContext, askNextQuestion]);
   
+  const handleCollectingUserState = useCallback(async (text: string) => {
+    const key = conversationContext.next_question_key as keyof User;
+    if (!key) {
+        setIsLoading(false);
+        return;
+    }
+    const updatedData = { ...conversationContext.collected_data, [key]: text };
+    setConversationContext(prev => ({...prev, collected_data: updatedData}));
+    askNextUserQuestion(updatedData as Partial<User>);
+  }, [conversationContext, askNextUserQuestion]);
+
   const handleConfirmAddState = useCallback(async (text: string) => {
     if (text.toLowerCase().trim() === 'ya') {
-        await finalizeZakatCollection(conversationContext.collected_data);
+        await finalizeZakatCollection(conversationContext.collected_data as Partial<Omit<Zakat, 'id' | 'createdAt'>>);
     } else {
         addBotMessage("Baik, penambahan laporan dibatalkan.");
         setConversationContext(initialConversationContext);
         setIsLoading(false);
     }
-  }, [conversationContext.collected_data]);
+  }, [conversationContext.collected_data, finalizeZakatCollection]);
+  
+  const handleConfirmAddUserState = useCallback(async (text: string) => {
+      if (text.toLowerCase().trim() === 'ya') {
+          await finalizeUserCollection(conversationContext.collected_data as Partial<User>);
+      } else {
+          addBotMessage("Baik, penambahan relawan dibatalkan.");
+          setConversationContext(initialConversationContext);
+          setIsLoading(false);
+      }
+  }, [conversationContext.collected_data, finalizeUserCollection]);
+
 
   const handleConfirmDeleteState = useCallback(async (text: string) => {
       const { pending_function_call } = conversationContext;
@@ -180,7 +296,7 @@ Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
       if (text.toLowerCase().trim() === 'ya') {
           addBotMessage("Baik, sedang memproses penghapusan...");
           try {
-              const result = await executeFunctionCall(pending_function_call);
+              const result = await executeFunctionCall(pending_function_call, currentUser);
               addBotMessage(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
           } catch (e) {
                const errorMessage = e instanceof Error ? e.message : 'Gagal menghapus data.';
@@ -194,14 +310,17 @@ Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
       setConversationContext(initialConversationContext);
       setIsLoading(false);
       
-  }, [conversationContext]);
+  }, [conversationContext, currentUser]);
 
   const handleIdleState = useCallback(async (text: string) => {
-    // Client-side intent detection for adding zakat to ensure consistent UX
     const lowercasedText = text.toLowerCase().trim();
     if (/\b(tambah|buat|catat|add)\b/.test(lowercasedText) && /\b(laporan|zakat)\b/.test(lowercasedText)) {
         startZakatCollection();
-        return; // Bypass Gemini and start collection immediately
+        return;
+    }
+    if (currentUser?.role === 'admin' && /\b(tambah|buat|add)\b/.test(lowercasedText) && /\b(relawan|user|pengguna)\b/.test(lowercasedText)) {
+        startUserCollection();
+        return;
     }
 
     try {
@@ -211,29 +330,38 @@ Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
         const functionCall = geminiResponse.functionCalls[0];
 
         if (functionCall.name === 'add_zakat') {
-            startZakatCollection(functionCall.args);
+            if (functionCall.args) {
+              startZakatCollection(functionCall.args);
+            } else {
+              addBotMessage("Maaf, argumen untuk menambah zakat tidak lengkap.");
+              setIsLoading(false);
+            }
             return; 
         } else if (functionCall.name === 'delete_zakat') {
-            addBotMessage(`Apakah Anda yakin ingin menghapus laporan zakat dengan ID ${functionCall.args.id}? (ya/tidak)`);
-            setConversationContext({
-                active_intent: 'CONFIRM_DELETE',
-                collected_data: {},
-                next_question_key: null,
-                pending_function_call: functionCall,
-            });
+            if (functionCall.args?.id) {
+              addBotMessage(`Apakah Anda yakin ingin menghapus laporan zakat dengan ID ${functionCall.args.id}? (ya/tidak)`);
+              setConversationContext({
+                  active_intent: 'CONFIRM_DELETE',
+                  collected_data: {},
+                  next_question_key: null,
+                  pending_function_call: functionCall,
+                  requires_file_upload: false,
+              });
+            } else {
+              addBotMessage("Maaf, ID zakat untuk dihapus tidak ditemukan.");
+            }
             setIsLoading(false);
             return;
         }
         
-        // For other functions, execute immediately
-        const result = await executeFunctionCall(functionCall);
+        const result = await executeFunctionCall(functionCall, currentUser);
         let botMessageText: string;
         let isComponent = false;
 
         if (typeof result === 'string') {
           botMessageText = result;
         } else if (Array.isArray(result) && result.length === 0) {
-          botMessageText = "Tidak ada data zakat yang ditemukan.";
+          botMessageText = "Tidak ada data yang ditemukan.";
         } else {
           botMessageText = JSON.stringify(result, null, 2);
           isComponent = true;
@@ -250,24 +378,51 @@ Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
     } finally {
       setIsLoading(false);
     }
-  }, [startZakatCollection]);
+  }, [startZakatCollection, startUserCollection, currentUser]);
 
+  const handleFileUpload = (file: File) => {
+      if (!file || conversationContext.active_intent !== 'ADD_ZAKAT' || conversationContext.next_question_key !== 'proofOfTransfer') return;
+  
+      setIsLoading(true);
+      setError(null);
+  
+      const MAX_FILE_SIZE = 3 * 1024 * 1024; // 3 MB
+      if (file.size > MAX_FILE_SIZE) {
+          addBotMessage("Ukuran file terlalu besar (maks. 3MB). Silakan pilih file lain.");
+          setIsLoading(false);
+          return;
+      }
+      
+      const userMessage: Message = { id: Date.now().toString(), sender: 'user', text: `[File diunggah: ${file.name}]`, isComponent: false };
+      setMessages(prev => [...prev, userMessage]);
+  
+      addBotMessage(`File '${file.name}' berhasil diterima. Perlu diketahui, file tidak diunggah ke server, hanya namanya yang dicatat.`);
+      
+      const updatedData = { ...conversationContext.collected_data, proofOfTransfer: file.name };
+      setConversationContext(prev => ({...prev, collected_data: updatedData, requires_file_upload: false, next_question_key: null }));
+      askNextQuestion(updatedData as Partial<Omit<Zakat, 'id' | 'createdAt'>>);
+  };
 
   const handleSendMessage = useCallback(async (text: string) => {
-    if (isLoading) return;
+    if (isLoading || !currentUser || conversationContext.requires_file_upload) return;
 
     const userMessage: Message = { id: Date.now().toString(), sender: 'user', text: text, isComponent: false };
     setMessages(prev => [...prev, userMessage]);
     setIsLoading(true);
     setError(null);
 
-    // --- State Routing ---
     switch (conversationContext.active_intent) {
         case 'ADD_ZAKAT':
-            handleCollectingState(text);
+            handleCollectingZakatState(text);
             break;
         case 'CONFIRM_ADD':
             handleConfirmAddState(text);
+            break;
+        case 'ADD_USER':
+            handleCollectingUserState(text);
+            break;
+        case 'CONFIRM_ADD_USER':
+            handleConfirmAddUserState(text);
             break;
         case 'CONFIRM_DELETE':
             handleConfirmDeleteState(text);
@@ -276,30 +431,64 @@ Apakah data sudah benar dan ingin dilanjutkan? (ya/tidak)`;
             handleIdleState(text);
             break;
     }
-  }, [isLoading, conversationContext, handleCollectingState, handleIdleState, handleConfirmDeleteState, handleConfirmAddState]);
+  }, [
+      isLoading, 
+      currentUser, 
+      conversationContext, 
+      handleCollectingZakatState, 
+      handleConfirmAddState, 
+      handleCollectingUserState,
+      handleConfirmAddUserState,
+      handleConfirmDeleteState,
+      handleIdleState
+  ]);
 
+  const handleLoginSuccess = (user: User) => {
+      setCurrentUser(user);
+      const welcomeMessage = `Assalamualaikum, ${user.name}! Anda login sebagai ${user.role}. Saya siap membantu Anda.\n\nContoh perintah:\n- 'Tampilkan semua laporan zakat'\n- 'Tambah laporan zakat'\n- 'Siapa saja yang berhak menerima zakat?'`;
+      
+      const adminCommands = `\n- 'Tampilkan semua relawan'\n- 'Tambah relawan baru'`;
 
-  useEffect(() => {
-    setMessages([
+      setMessages([
       {
         id: '1',
         sender: 'bot',
-        text: "Assalamualaikum! Saya Bot Laporan Zakat. Saya bisa membantu Anda mencatat dan mengelola data zakat. Anda juga bisa bertanya kepada saya seputar Fikih Zakat.\n\nContoh perintah:\n- 'Tampilkan semua laporan zakat'\n- 'Tambah laporan zakat'\n- 'Siapa saja yang berhak menerima zakat?'",
+        text: user.role === 'admin' ? welcomeMessage + adminCommands : welcomeMessage,
         isComponent: false
       }
     ]);
-  }, []);
+  };
+
+  const handleLogout = () => {
+      setCurrentUser(null);
+      setMessages([]);
+      setConversationContext(initialConversationContext);
+  };
+
+  if (!currentUser) {
+      return <Login onLoginSuccess={handleLoginSuccess} />;
+  }
 
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white">
-      <header className="bg-gray-800 p-4 shadow-md">
-        <h1 className="text-2xl font-bold text-center text-cyan-400">AI Pelaporan Zakat</h1>
-        <p className="text-center text-sm text-gray-400">Antarmuka Bahasa Alami untuk Database Zakat</p>
+      <header className="bg-gray-800 p-4 shadow-md flex justify-between items-center">
+        <div>
+          <h1 className="text-2xl font-bold text-cyan-400">AI Pelaporan Zakat</h1>
+          <p className="text-left text-sm text-gray-400">Login sebagai: {currentUser.name} ({currentUser.role})</p>
+        </div>
+        <button
+            onClick={handleLogout}
+            className="px-4 py-2 bg-red-600 rounded-lg font-semibold hover:bg-red-700 transition-colors"
+        >
+            Logout
+        </button>
       </header>
       <ChatInterface
         messages={messages}
         onSendMessage={handleSendMessage}
         isLoading={isLoading}
+        requiresFileUpload={conversationContext.requires_file_upload}
+        onFileUpload={handleFileUpload}
       />
       {error && <div className="p-4 bg-red-800 text-center text-white">{error}</div>}
     </div>

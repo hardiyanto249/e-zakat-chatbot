@@ -19,7 +19,19 @@ export interface Zakat {
 }
 
 export interface FunctionCall {
+    // FIX: Make properties optional to match @google/genai's FunctionCall type.
+    name?: string;
+    args?: Record<string, any>;
+    id?: string;
+}
+
+export type Role = 'admin' | 'user';
+
+export interface User {
+    volunteerCode: string;
+    password?: string; // Should be handled securely, plain text for this simulation
     name: string;
-    args: Record<string, any>;
-    id: string;
+    lazName: string;
+    description: string;
+    role: Role;
 }
